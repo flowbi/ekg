@@ -95,6 +95,7 @@ _UUID_RE = re.compile(
 )
 
 _META_VIEW_KEYS: List[str] = [
+    "meta.view.control_sdts",
     "meta.view.data_source",
     "meta.view.source_table",
     "meta.view.graph_entity",
@@ -123,7 +124,7 @@ class SqlRegistry:
     See queries.ini header for full documentation.
     """
 
-    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst"})
+    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst", "gsr_sdts"})
 
     def __init__(self, path: Path = QUERIES_FILE) -> None:
         self._parser = configparser.ConfigParser(interpolation=None)
@@ -184,11 +185,19 @@ class DBConfig:
 class TenantConfig:
     gsr_client: str
     gsr_inst:   str
+    gsr_sdts:   Optional[str] = None
 
     def __post_init__(self) -> None:
         for name, val in [("gsr_client", self.gsr_client), ("gsr_inst", self.gsr_inst)]:
             if not _UUID_RE.match(val):
                 raise ValueError(f"TenantConfig: '{name}' must be a valid UUID, got {val!r}")
+        if self.gsr_sdts:
+            try:
+                datetime.fromisoformat(self.gsr_sdts.replace("T", " "))
+            except ValueError as exc:
+                raise ValueError(
+                    f"TenantConfig: 'gsr_sdts' must be an ISO timestamp, got {self.gsr_sdts!r}"
+                ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +294,7 @@ class MetaRepository:
         self._create_temp_views()
 
     def _create_temp_views(self) -> None:
+        self._tenant.gsr_sdts = None
         subs = {
             "schema":     self._cfg.schema,
             "gsr_client": self._tenant.gsr_client,
@@ -296,7 +306,16 @@ class MetaRepository:
                 cur.execute(self._sql.get(key, **subs))
                 names.append(key.split(".")[-1])
         self._conn.commit()
+        self._tenant.gsr_sdts = self._load_latest_gsr_sdts()
         log.info("Created %d temporary meta views: %s", len(names), ", ".join(names))
+
+    def _load_latest_gsr_sdts(self) -> str:
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT gsr_sdts::text FROM control_sdts LIMIT 1")
+            row = cur.fetchone()
+        if not row or not row[0]:
+            raise RuntimeError("Could not resolve latest gsr_sdts from temp view control_sdts")
+        return row[0]
 
     def close(self) -> None:
         if self._conn:
