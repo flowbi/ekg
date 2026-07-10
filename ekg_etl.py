@@ -122,7 +122,7 @@ class SqlRegistry:
     to both the CTE fragments and the main query body.
     """
 
-    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst"})
+    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst", "gsr_sdts"})
 
     def __init__(self, path: Path = QUERIES_FILE) -> None:
         self._parser = configparser.ConfigParser(interpolation=None)
@@ -157,6 +157,8 @@ class SqlRegistry:
             raise KeyError(f"SqlRegistry: [{key}] has no 'sql' option")
 
         body = self._parser.get(key, "sql")
+        body = self._substitute(body, subs)
+        self._cache[cache_key] = body
 
         # Assemble CTE preamble when the section declares cte names
         cte_names: List[str] = []
@@ -176,11 +178,8 @@ class SqlRegistry:
                 fragment = self._parser.get(cte_key, "sql")
                 fragment = self._substitute(fragment, subs)
                 fragments.append(fragment)
-            body = "WITH
-" + ",
-".join(fragments) + "
-" + body
-
+            body = "WITH\n" + ",\n".join(fragments) + "\n" + body
+            
         body = self._substitute(body, subs)
         self._cache[cache_key] = body
         return body
@@ -313,14 +312,18 @@ class MetaRepository:
         self._secrets = secrets
         self._conn    = None
         self._sql     = get_sql_registry()
+        self._current_sdts: Optional[datetime] = None
 
     def _subs(self) -> dict:
         """Structural substitutions for all meta queries."""
-        return {
-            "schema":     self._cfg.schema,
+        subs = {
+            "schema": self._cfg.schema,
             "gsr_client": self._tenant.gsr_client,
-            "gsr_inst":   self._tenant.gsr_inst,
+            "gsr_inst": self._tenant.gsr_inst,
         }
+        if self._current_sdts is not None:
+            subs["gsr_sdts"] = self._current_sdts.strftime("%Y-%m-%d %H:%M:%S.%f")
+        return subs
 
     def connect(self) -> None:
         self._conn = _pg_connect(self._cfg, self._secrets)
@@ -422,6 +425,36 @@ class MetaRepository:
                 )
         log.info("Loaded %d concept tag assignments.", sum(len(v) for v in result.values()))
         return result
+
+    def load_current_sdts(self) -> datetime:
+        """
+        Fetch the active snapshot timestamp (gsr_sdts) for the current tenant.
+
+        Called once at pipeline startup. The timestamp is stored on this repository
+        so later meta queries can substitute {gsr_sdts} safely.
+        """
+        sql = self._sql.get("meta.load_current_sdts", **self._subs())
+        with self._cur() as cur:
+            cur.execute(sql)
+            row = cur.fetchone()
+
+        if row is None:
+            raise RuntimeError(
+                f"No active control_sdts row found for "
+                f"gsr_client={self._tenant.gsr_client} "
+                f"gsr_inst={self._tenant.gsr_inst}. "
+                f"Ensure exactly one active control_sdts row exists for this tenant."
+            )
+
+        sdts: datetime = row["gsr_sdts"]
+        self._current_sdts = sdts
+
+        log.info(
+            "Current snapshot timestamp (gsr_sdts): %s  "
+            "(client=%s inst=%s)",
+            sdts, self._tenant.gsr_client, self._tenant.gsr_inst,
+        )
+        return sdts
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +880,7 @@ class EKGETLPipeline:
         self._meta_repo   = MetaRepository(meta_cfg, tenant, secrets)
         self._run_repo    = RunRepository(run_cfg, secrets)
         self._src_factory = SourceConnectionFactory(secrets)
+        self._current_sdts: Optional[datetime] = None   # set at connect time
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -856,6 +890,7 @@ class EKGETLPipeline:
         """Initial / full reload using each target's bulk-load mechanism."""
         self._meta_repo.connect()
         self._run_repo.connect()
+        self._current_sdts = self._meta_repo.load_current_sdts()
         run_id   = self._run_repo.start_run("full", self._bulk_staging, triggered_by)
         total_up = total_sk = 0
         job_id   = ""
@@ -921,6 +956,7 @@ class EKGETLPipeline:
         """Incremental run: change detection + graph upserts / hard deletes."""
         self._meta_repo.connect()
         self._run_repo.connect()
+        self._current_sdts = self._meta_repo.load_current_sdts()
         run_id    = self._run_repo.start_run("incremental", "", triggered_by)
         run_start = _utcnow()
         total_up = total_del = total_sk = 0
@@ -1262,3 +1298,4 @@ if __name__ == "__main__":
         pipeline.run_full(triggered_by=triggered_by)
     else:
         pipeline.run_incremental(triggered_by=triggered_by)
+
