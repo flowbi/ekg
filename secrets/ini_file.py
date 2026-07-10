@@ -184,14 +184,8 @@ class IniSecretsProvider(SecretsProvider):
 
         _check_permissions(resolved)
 
-        parser = configparser.ConfigParser(
-            # Preserve key casing (username, not Username)
-            # configparser lowercases keys by default; override with str identity
-            optionxform=str,
-            # Allow values that contain = (e.g. base64 tokens)
-            strict=True,
-            interpolation=None,
-        )
+        parser = configparser.ConfigParser(strict=True, interpolation=None)
+        parser.optionxform = str
         try:
             read_ok = parser.read(str(resolved), encoding="utf-8")
             if not read_ok:

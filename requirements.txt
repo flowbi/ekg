@@ -1,0 +1,79 @@
+# =============================================================================
+# requirements.txt  –  EKG ETL pipeline dependencies
+# =============================================================================
+# Core dependencies are always required.
+# Optional dependencies are grouped by feature; install only what you need.
+#
+# Quick-start examples
+# ────────────────────
+# Minimal (INI + env secrets, Neo4j target, console logging only):
+#   pip install -r requirements.txt --no-deps
+#   pip install psycopg2-binary requests neo4j
+#
+# Full installation (all targets, all secret providers, all log targets):
+#   pip install -r requirements.txt
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# Core  –  always required
+# ---------------------------------------------------------------------------
+
+# PostgreSQL driver for meta and run databases
+psycopg2-binary>=2.9
+
+# HTTP client used by Neptune Gremlin HTTP and Neptune Bulk Loader REST API
+requests>=2.31
+
+
+# ---------------------------------------------------------------------------
+# Graph targets  –  install the one(s) you need
+# ---------------------------------------------------------------------------
+
+# AWS Neptune
+# (uses requests for Gremlin HTTP and boto3 for S3 + Bulk Loader REST API)
+boto3>=1.34                         # Neptune + AWS Secrets Manager + CloudWatch
+
+# Neo4j  (Bolt driver)
+neo4j>=5.18
+
+# Azure Cosmos DB for Apache Gremlin
+gremlinpython>=3.7
+
+# Google Spanner Graph
+google-cloud-spanner>=3.43
+
+
+# ---------------------------------------------------------------------------
+# Secret providers  –  install the one(s) you need
+# ---------------------------------------------------------------------------
+
+# AWS Secrets Manager  →  included in boto3 above
+
+# Azure Key Vault
+azure-keyvault-secrets>=4.7
+azure-identity>=1.15                # DefaultAzureCredential
+
+# Google Secret Manager
+google-cloud-secret-manager>=2.18
+
+# HashiCorp Vault (KV v2)
+hvac>=2.1
+
+# INI file provider  →  stdlib only (configparser, os, stat, pathlib)
+
+# Environment variable provider  →  stdlib only
+
+
+# ---------------------------------------------------------------------------
+# Logging targets  –  install the one(s) you need
+# ---------------------------------------------------------------------------
+
+# AWS CloudWatch Logs
+watchtower>=3.0                     # requires boto3 (listed above)
+
+# Azure Monitor / Application Insights
+opencensus-ext-azure>=1.1
+
+# Google Cloud Logging
+google-cloud-logging>=3.9

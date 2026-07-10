@@ -32,7 +32,7 @@ CREATE SCHEMA IF NOT EXISTS run;
 -- 1. LOAD RUNS
 --    One row per pipeline execution (full or incremental).
 -- ---------------------------------------------------------------------------
-CREATE TABLE run.load_run (
+CREATE TABLE IF NOT EXISTS run.load_run (
     run_id          UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- 'full'        – Neptune Bulk Loader via S3 CSV
@@ -71,7 +71,7 @@ COMMENT ON COLUMN run.load_run.bulk_load_job_id IS 'Bulk-load job ID from the ta
 --    Per-mapping statistics for a single run.
 --    mapping_id references meta.entity_mapping.mapping_id (UUID, no FK).
 -- ---------------------------------------------------------------------------
-CREATE TABLE run.load_run_detail (
+CREATE TABLE IF NOT EXISTS run.load_run_detail (
     detail_id       UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- References run.load_run.run_id
@@ -112,7 +112,7 @@ COMMENT ON COLUMN run.load_run_detail.operation  IS
 --
 --    mapping_id references meta.entity_mapping.mapping_id (UUID, no FK).
 -- ---------------------------------------------------------------------------
-CREATE TABLE run.table_watermark (
+CREATE TABLE IF NOT EXISTS run.table_watermark (
     watermark_id        UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- References meta.entity_mapping.mapping_id (cross-DB, no FK constraint)
@@ -149,7 +149,7 @@ COMMENT ON COLUMN run.table_watermark.mapping_id IS
 --    mapping_id references meta.entity_mapping.mapping_id (UUID, no FK).
 --    first/last_seen_run_id reference run.load_run.run_id.
 -- ---------------------------------------------------------------------------
-CREATE TABLE run.row_hash (
+CREATE TABLE IF NOT EXISTS run.row_hash (
     hash_id             UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
 
     -- References meta.entity_mapping.mapping_id (cross-DB, no FK constraint)
@@ -182,8 +182,8 @@ COMMENT ON COLUMN run.row_hash.mapping_id IS
 -- ---------------------------------------------------------------------------
 -- INDEXES
 -- ---------------------------------------------------------------------------
-CREATE INDEX idx_run_detail_run_id    ON run.load_run_detail (run_id);
-CREATE INDEX idx_run_detail_mapping   ON run.load_run_detail (mapping_id);
-CREATE INDEX idx_watermark_mapping    ON run.table_watermark (mapping_id);
-CREATE INDEX idx_row_hash_mapping     ON run.row_hash        (mapping_id);
-CREATE INDEX idx_row_hash_lookup      ON run.row_hash        (mapping_id, entity_id_value);
+CREATE INDEX IF NOT EXISTS idx_run_detail_run_id    ON run.load_run_detail (run_id);
+CREATE INDEX IF NOT EXISTS idx_run_detail_mapping   ON run.load_run_detail (mapping_id);
+CREATE INDEX IF NOT EXISTS idx_watermark_mapping    ON run.table_watermark (mapping_id);
+CREATE INDEX IF NOT EXISTS idx_row_hash_mapping     ON run.row_hash        (mapping_id);
+CREATE INDEX IF NOT EXISTS idx_row_hash_lookup      ON run.row_hash        (mapping_id, entity_id_value);

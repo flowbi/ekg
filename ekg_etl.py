@@ -94,17 +94,6 @@ _UUID_RE = re.compile(
     re.IGNORECASE,
 )
 
-_META_VIEW_KEYS: List[str] = [
-    "meta.view.control_sdts",
-    "meta.view.data_source",
-    "meta.view.source_table",
-    "meta.view.graph_entity",
-    "meta.view.entity_mapping",
-    "meta.view.attribute_mapping",
-    "meta.view.concept_tag",
-    "meta.view.entity_tag",
-]
-
 EKG_BATCH_SIZE = int(os.environ.get("EKG_BATCH_SIZE", "50"))
 
 log = logging.getLogger("ekg_etl")
@@ -120,11 +109,20 @@ def _utcnow() -> datetime:
 
 class SqlRegistry:
     """
-    Loads SQL from queries.ini and resolves structural placeholders.
-    See queries.ini header for full documentation.
+    Loads SQL from queries.ini, assembles CTE preambles, and resolves
+    structural placeholders.
+
+    CTE assembly
+    ────────────
+    When a section declares a `ctes` key (comma-separated list of CTE names),
+    get() prepends a WITH clause built from the corresponding [meta.cte.*]
+    fragments before returning the assembled query.
+
+    Structural substitutions ({schema}, {gsr_client}, {gsr_inst}) are applied
+    to both the CTE fragments and the main query body.
     """
 
-    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst", "gsr_sdts"})
+    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst"})
 
     def __init__(self, path: Path = QUERIES_FILE) -> None:
         self._parser = configparser.ConfigParser(interpolation=None)
@@ -135,9 +133,19 @@ class SqlRegistry:
         log.debug("SqlRegistry: loaded %d sections from %s.", len(self._parser.sections()), path)
 
     def get(self, key: str, **subs: str) -> str:
+        """
+        Return the fully assembled SQL for *key* with:
+          1. CTE fragments prepended as a WITH clause (when ctes= is declared)
+          2. Structural placeholders substituted in both CTEs and query body
+
+        Raises KeyError for unknown sections.
+        Raises ValueError for malformed UUID substitutions.
+        """
         for name in ("gsr_client", "gsr_inst"):
             if name in subs and not _UUID_RE.match(subs[name]):
-                raise ValueError(f"SqlRegistry: '{name}' must be a valid UUID, got {subs[name]!r}")
+                raise ValueError(
+                    f"SqlRegistry: '{name}' must be a valid UUID, got {subs[name]!r}"
+                )
 
         cache_key = key + "|" + "|".join(f"{k}={v}" for k, v in sorted(subs.items()))
         if cache_key in self._cache:
@@ -148,12 +156,40 @@ class SqlRegistry:
         if not self._parser.has_option(key, "sql"):
             raise KeyError(f"SqlRegistry: [{key}] has no 'sql' option")
 
-        sql = self._parser.get(key, "sql")
+        body = self._parser.get(key, "sql")
+
+        # Assemble CTE preamble when the section declares cte names
+        cte_names: List[str] = []
+        if self._parser.has_option(key, "ctes"):
+            raw = self._parser.get(key, "ctes")
+            cte_names = [n.strip() for n in raw.split(",") if n.strip()]
+
+        if cte_names:
+            fragments: List[str] = []
+            for name in cte_names:
+                cte_key = f"meta.cte.{name}"
+                if not self._parser.has_section(cte_key):
+                    raise KeyError(
+                        f"SqlRegistry: CTE '{name}' referenced by [{key}] "
+                        f"has no section [{cte_key}]"
+                    )
+                fragment = self._parser.get(cte_key, "sql")
+                fragment = self._substitute(fragment, subs)
+                fragments.append(fragment)
+            body = "WITH
+" + ",
+".join(fragments) + "
+" + body
+
+        body = self._substitute(body, subs)
+        self._cache[cache_key] = body
+        return body
+
+    def _substitute(self, sql: str, subs: Dict[str, str]) -> str:
+        """Apply allowed structural substitutions to a SQL string."""
         for name, value in subs.items():
             if name in self._ALLOWED:
                 sql = sql.replace("{" + name + "}", value)
-
-        self._cache[cache_key] = sql
         return sql
 
 
@@ -185,19 +221,11 @@ class DBConfig:
 class TenantConfig:
     gsr_client: str
     gsr_inst:   str
-    gsr_sdts:   Optional[str] = None
 
     def __post_init__(self) -> None:
         for name, val in [("gsr_client", self.gsr_client), ("gsr_inst", self.gsr_inst)]:
             if not _UUID_RE.match(val):
                 raise ValueError(f"TenantConfig: '{name}' must be a valid UUID, got {val!r}")
-        if self.gsr_sdts:
-            try:
-                datetime.fromisoformat(self.gsr_sdts.replace("T", " "))
-            except ValueError as exc:
-                raise ValueError(
-                    f"TenantConfig: 'gsr_sdts' must be an ISO timestamp, got {self.gsr_sdts!r}"
-                ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -286,36 +314,23 @@ class MetaRepository:
         self._conn    = None
         self._sql     = get_sql_registry()
 
+    def _subs(self) -> dict:
+        """Structural substitutions for all meta queries."""
+        return {
+            "schema":     self._cfg.schema,
+            "gsr_client": self._tenant.gsr_client,
+            "gsr_inst":   self._tenant.gsr_inst,
+        }
+
     def connect(self) -> None:
         self._conn = _pg_connect(self._cfg, self._secrets)
         with self._conn.cursor() as cur:
             cur.execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
         self._conn.commit()
-        self._create_temp_views()
-
-    def _create_temp_views(self) -> None:
-        self._tenant.gsr_sdts = None
-        subs = {
-            "schema":     self._cfg.schema,
-            "gsr_client": self._tenant.gsr_client,
-            "gsr_inst":   self._tenant.gsr_inst,
-        }
-        names = []
-        with self._conn.cursor() as cur:
-            for key in _META_VIEW_KEYS:
-                cur.execute(self._sql.get(key, **subs))
-                names.append(key.split(".")[-1])
-        self._conn.commit()
-        self._tenant.gsr_sdts = self._load_latest_gsr_sdts()
-        log.info("Created %d temporary meta views: %s", len(names), ", ".join(names))
-
-    def _load_latest_gsr_sdts(self) -> str:
-        with self._conn.cursor() as cur:
-            cur.execute("SELECT gsr_sdts::text FROM control_sdts LIMIT 1")
-            row = cur.fetchone()
-        if not row or not row[0]:
-            raise RuntimeError("Could not resolve latest gsr_sdts from temp view control_sdts")
-        return row[0]
+        log.info(
+            "Meta DB connected (read-only). Tenant: client=%s inst=%s",
+            self._tenant.gsr_client, self._tenant.gsr_inst,
+        )
 
     def close(self) -> None:
         if self._conn:
@@ -329,7 +344,7 @@ class MetaRepository:
         return self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
     def load_mappings(self) -> List[EntityMapping]:
-        sql = self._sql.get("meta.load_mappings")
+        sql = self._sql.get("meta.load_mappings", **self._subs())
         with self._cur() as cur:
             cur.execute(sql)
             rows = cur.fetchall()
@@ -378,7 +393,7 @@ class MetaRepository:
         return mappings
 
     def _load_attributes(self, mapping_id: str) -> List[AttributeMapping]:
-        sql = self._sql.get("meta.load_attributes")
+        sql = self._sql.get("meta.load_attributes", **self._subs())
         with self._cur() as cur:
             cur.execute(sql, (mapping_id,))
             return [
@@ -397,7 +412,7 @@ class MetaRepository:
             ]
 
     def _load_concept_tags(self) -> Dict[str, List[Tuple[str, str, str, Optional[str]]]]:
-        sql = self._sql.get("meta.load_concept_tags")
+        sql = self._sql.get("meta.load_concept_tags", **self._subs())
         result: Dict[str, List[Tuple[str, str, str, Optional[str]]]] = {}
         with self._cur() as cur:
             cur.execute(sql)
