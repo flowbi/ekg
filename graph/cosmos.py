@@ -230,7 +230,7 @@ class CosmosGraphTarget(GraphTarget):
     _CONFLICT_STATUSES = (409, 412)
     _MAX_CONFLICT_RETRIES = 4
 
-    def _submit(self, query: str) -> None:
+    def _submit(self, query: str) -> list:
         attempt = 0
         while True:
             attempt += 1
@@ -261,7 +261,7 @@ class CosmosGraphTarget(GraphTarget):
                 raise RuntimeError(
                     f"Cosmos Gremlin error (status {status}): {result.status_attributes}"
                 )
-            return
+            return result.all().result()
 
     # ------------------------------------------------------------------
     # Incremental operations
@@ -285,7 +285,11 @@ class CosmosGraphTarget(GraphTarget):
     def upsert_edge(
         self, edge_id: str, label: str, from_id: str, to_id: str, props: Dict[str, Any]
     ) -> None:
-        self._submit(
+        # g.V(from_id).addE(...).to(g.V(to_id)) silently produces zero results
+        # (no exception, HTTP 200) if either vertex id doesn't exist — check
+        # for that here so a bad from_id/to_id shows up as a warning instead
+        # of a silently missing edge.
+        written = self._submit(
             f"g.E('{_esc(edge_id)}').fold().coalesce("
             f"__.unfold(),"
             f"g.V('{_esc(from_id)}')"
@@ -294,6 +298,15 @@ class CosmosGraphTarget(GraphTarget):
             f".property('id','{_esc(edge_id)}')"
             f"){_prop_chain(props)}"
         )
+        if not written:
+            missing = [
+                side for side, vid in (("from", from_id), ("to", to_id))
+                if not self._submit(f"g.V('{_esc(vid)}').limit(1)")
+            ]
+            log.warning(
+                "Edge %s (%s) NOT created — %s vertex id(s) not found: from_id=%s to_id=%s",
+                edge_id, label, missing or "unknown", from_id, to_id,
+            )
 
     def delete_vertex(self, node_id: str) -> None:
         self._submit(f"g.V('{_esc(node_id)}').drop()")
@@ -320,7 +333,7 @@ class CosmosGraphTarget(GraphTarget):
 
     def upsert_tagged_as(self, node_id: str, tag_id: str) -> None:
         edge_id = f"{node_id}__TAG__{tag_id}"
-        self._submit(
+        written = self._submit(
             f"g.E('{_esc(edge_id)}').fold().coalesce("
             f"__.unfold(),"
             f"g.V('{_esc(node_id)}')"
@@ -329,6 +342,11 @@ class CosmosGraphTarget(GraphTarget):
             f".property('id','{_esc(edge_id)}')"
             f")"
         )
+        if not written:
+            log.warning(
+                "TAGGED_AS edge %s NOT created — node_id=%s or tag_id=%s not found.",
+                edge_id, node_id, tag_id,
+            )
 
     # ------------------------------------------------------------------
     # Bulk load  (batched Gremlin upserts)

@@ -1286,8 +1286,8 @@ class EKGETLPipeline:
                                 self._target.write_bulk_node(rec)
                             else:
                                 self._target.write_bulk_edge(rec)
-                                log.info("Edge %s (%s): %s -> %s",
-                                          rec.entity_id, rec.label, rec.from_id, rec.to_id)
+                                ##log.info("Edge %s (%s): %s -> %s",
+                                ##         rec.entity_id, rec.label, rec.from_id, rec.to_id)
                             written += 1
                     total_up += written
                     total_sk += skipped
@@ -1519,7 +1519,7 @@ class EKGETLPipeline:
             for i in range(0, len(result.upsert_edges), EKG_BATCH_SIZE):
                 for edge_id, label, from_id, to_id, props in result.upsert_edges[i : i + EKG_BATCH_SIZE]:
                     self._target.upsert_edge(edge_id, label, from_id, to_id, props)
-                    log.info("Edge %s (%s): %s -> %s", edge_id, label, from_id, to_id)
+                    ##log.info("Edge %s (%s): %s -> %s", edge_id, label, from_id, to_id)
                     total += 1
                 log.debug("Upserted %d/%d edges (mapping %s).",
                            total, len(result.upsert_edges), m.mapping_id)
