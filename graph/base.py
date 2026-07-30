@@ -5,6 +5,12 @@ Every graph target implementation must subclass GraphTarget and implement
 all abstract methods.  The EKGETLPipeline calls only these methods; it has
 no knowledge of which target is active.
 
+Precheck lifecycle
+──────────────────
+  precheck()        – verify connectivity and authentication before the pipeline
+                      starts.  Calls _do_precheck() on the implementation.
+                      Raises PreCheckError on failure, aborting the pipeline.
+
 Bulk-load lifecycle
 ───────────────────
   begin_bulk()                    – prepare buffers / connections / staging area
@@ -27,9 +33,26 @@ Incremental lifecycle (per row)
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+log = logging.getLogger("ekg_etl.graph")
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
+
+class PreCheckError(RuntimeError):
+    """
+    Raised by GraphTarget.precheck() when connectivity or authentication
+    to the target graph database cannot be confirmed.
+
+    The pipeline catches this at startup and aborts immediately with a
+    clear log message rather than failing silently mid-run.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +102,7 @@ class BulkRecord:
     entity_type : str
         'node' or 'edge'.
     entity_id : str
-        Neptune-style ~id value.
+        Graph ~id value.
     label : str
         Node or edge label.
     props : dict
@@ -114,6 +137,44 @@ class GraphTarget(ABC):
         self._config = config
 
     # ------------------------------------------------------------------
+    # Precheck  (concrete wrapper + abstract implementation)
+    # ------------------------------------------------------------------
+
+    def precheck(self) -> None:
+        """
+        Verify connectivity and authentication to the target graph database.
+
+        Called once at pipeline startup, before any data is read from
+        source databases.  Raises PreCheckError on failure, which the
+        pipeline catches and re-raises to abort immediately.
+
+        Subclasses implement _do_precheck() with target-specific logic.
+        """
+        target = self._config.target
+        log.info("Precheck: verifying connectivity to %s graph target …", target)
+        try:
+            self._do_precheck()
+        except PreCheckError:
+            raise   # already well-formed — let it propagate
+        except Exception as exc:
+            raise PreCheckError(
+                f"Precheck failed for target '{target}': {exc}"
+            ) from exc
+        log.info("Precheck: %s graph target OK.", target)
+
+    @abstractmethod
+    def _do_precheck(self) -> None:
+        """
+        Target-specific connectivity and authentication check.
+
+        Should make the lightest possible authenticated request that
+        confirms both network reachability and credential validity.
+
+        Raise any exception on failure; the precheck() wrapper converts
+        it to a PreCheckError with context.
+        """
+
+    # ------------------------------------------------------------------
     # Incremental write operations
     # ------------------------------------------------------------------
 
@@ -124,10 +185,7 @@ class GraphTarget(ABC):
         label:   str,
         props:   Dict[str, Any],
     ) -> None:
-        """
-        Insert or update a node identified by *node_id*.
-        All properties in *props* are set on the node.
-        """
+        """Insert or update a node. All properties in *props* are set."""
 
     @abstractmethod
     def upsert_edge(
@@ -138,10 +196,7 @@ class GraphTarget(ABC):
         to_id:    str,
         props:    Dict[str, Any],
     ) -> None:
-        """
-        Insert or update an edge identified by *edge_id*.
-        The edge connects *from_id* → *to_id* with *label*.
-        """
+        """Insert or update an edge connecting *from_id* → *to_id*."""
 
     @abstractmethod
     def delete_vertex(self, node_id: str) -> None:
@@ -159,19 +214,11 @@ class GraphTarget(ABC):
         tag_category: str,
         display_name: Optional[str],
     ) -> None:
-        """
-        Insert or update a ConceptTag node.
-        The node is identified by *tag_id* and carries name, category,
-        and display_name properties.
-        """
+        """Insert or update a ConceptTag node."""
 
     @abstractmethod
     def upsert_tagged_as(self, node_id: str, tag_id: str) -> None:
-        """
-        Insert or update a TAGGED_AS edge from a data node to a ConceptTag node.
-        The edge ID is derived deterministically from (node_id, tag_id) so that
-        repeated calls are idempotent.
-        """
+        """Insert or update a TAGGED_AS edge from a data node to a ConceptTag."""
 
     # ------------------------------------------------------------------
     # Bulk load lifecycle
@@ -179,11 +226,7 @@ class GraphTarget(ABC):
 
     @abstractmethod
     def begin_bulk(self) -> None:
-        """
-        Prepare for a bulk load operation.
-        Called once before any write_bulk_* calls.
-        May open CSV buffers, start a transaction, or set up staging.
-        """
+        """Prepare for bulk load. Called once before any write_bulk_* calls."""
 
     @abstractmethod
     def write_bulk_node(self, record: BulkRecord) -> None:
@@ -196,9 +239,8 @@ class GraphTarget(ABC):
     @abstractmethod
     def commit_bulk(self) -> str:
         """
-        Finalise the bulk load and trigger ingestion into the graph.
-        Returns an opaque job-ID string that is stored in run.load_run.bulk_load_job_id.
-        May return "" if the target does not produce a job ID.
+        Finalise the bulk load and trigger ingestion.
+        Returns an opaque job-ID string (may be "" if target has no job ID).
         """
 
     # ------------------------------------------------------------------
@@ -210,7 +252,7 @@ class GraphTarget(ABC):
         """Release all connections and resources."""
 
     # ------------------------------------------------------------------
-    # Optional: target name for logging
+    # Helpers
     # ------------------------------------------------------------------
 
     @property

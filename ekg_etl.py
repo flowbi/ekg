@@ -65,15 +65,18 @@ import io
 import json
 import logging
 import os
+import glob
 import re
 import sys
 import time
 import uuid
 import configparser
+import jaydebeapi
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+
 
 import psycopg2
 import psycopg2.extras
@@ -122,7 +125,7 @@ class SqlRegistry:
     to both the CTE fragments and the main query body.
     """
 
-    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst", "gsr_sdts"})
+    _ALLOWED = frozenset({"schema", "gsr_client", "gsr_inst", "gsr_sdts", "java_home"})
 
     def __init__(self, path: Path = QUERIES_FILE) -> None:
         self._parser = configparser.ConfigParser(interpolation=None)
@@ -270,7 +273,7 @@ class EntityMapping:
     entity_id:            str
     entity_name:          str
     entity_type:          str
-    id_column_expr:       str
+    id_column_expr:       Optional[str]
     from_id_column_expr:  Optional[str]
     to_id_column_expr:    Optional[str]
     row_filter:           Optional[str]
@@ -320,6 +323,7 @@ class MetaRepository:
             "schema": self._cfg.schema,
             "gsr_client": self._tenant.gsr_client,
             "gsr_inst": self._tenant.gsr_inst,
+            "java_home": os.environ.get("JAVA_HOME", ""),
         }
         if self._current_sdts is not None:
             subs["gsr_sdts"] = self._current_sdts.strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -345,6 +349,37 @@ class MetaRepository:
 
     def _cur(self):
         return self._conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+
+
+    def get_identifier_quote_char(self, conn: jaydebeapi.Connection) -> str:
+        """
+        Ask the JDBC driver what identifier quote character it uses.
+        Returns e.g. '"' for Postgres/Snowflake/SQL Server, '`' for MySQL.
+        Returns ' ' (a single space) if the driver reports no quoting support.
+        """
+        metadata = conn.jconn.getMetaData()
+        quote_char = metadata.getIdentifierQuoteString()
+        return str(quote_char)
+
+    def quote_ident(self, identifier: str, quote_char: str = '"') -> str:
+        """
+        Quote a single identifier using the given quote character,
+        doubling any embedded occurrences of that character (standard
+        SQL escaping rule, used by ANSI SQL / Postgres / Snowflake / SQL Server;
+        MySQL follows the same doubling rule for backticks).
+        """
+        if quote_char.strip() == "":
+            # Driver reports no quoting support - return identifier unquoted
+            return identifier
+        return quote_char + identifier.replace(quote_char, quote_char * 2) + quote_char
+
+    def quote_qualified(self, *parts: str, quote_char: str = '"') -> str:
+        """
+        Quote a dotted, schema-qualified identifier, e.g.
+        quote_qualified("my_schema", "my table") -> "my_schema"."my table"
+        """
+        return ".".join(self.quote_ident(p, quote_char) for p in parts)
 
     def load_mappings(self) -> List[EntityMapping]:
         sql = self._sql.get("meta.load_mappings", **self._subs())
@@ -372,11 +407,11 @@ class MetaRepository:
                 driver_module        = r["driver_module"],
                 host                 = r["host"],
                 port                 = r["port"],
-                database_name        = r["database_name"],
+                database_name        = self.quote_qualified(r["database_name"]),
                 secret_ref           = r["secret_ref"],
                 extra_params         = r["extra_params"] or {},
-                schema_name          = r["schema_name"],
-                table_name           = r["table_name"],
+                schema_name          = self.quote_qualified(r["schema_name"]),
+                table_name           = self.quote_qualified(r["table_name"]),
                 override_query       = r["override_query"],
                 partition_column     = r["partition_column"],
                 partition_size       = r["partition_size"] or 100_000,
@@ -397,6 +432,7 @@ class MetaRepository:
 
     def _load_attributes(self, mapping_id: str) -> List[AttributeMapping]:
         sql = self._sql.get("meta.load_attributes", **self._subs())
+
         with self._cur() as cur:
             cur.execute(sql, (mapping_id,))
             return [
@@ -607,6 +643,54 @@ class SourceConnectionFactory:
         self._secrets = secrets
         self._cache: Dict[str, Any] = {}
 
+    @staticmethod
+    def _resolve_jvm_path(extra_params: Dict[str, Any]) -> Optional[str]:
+        """
+        Resolve a JPype-compatible JVM shared library path.
+
+        JayDeBeApi uses JPype under the hood. JPype needs the actual JVM library
+        file, not just JAVA_HOME. On macOS that is usually:
+            <JAVA_HOME>/lib/server/libjvm.dylib
+        """
+        configured = (
+            extra_params.get("jvm_path")
+            or os.environ.get("JPYPE_JVM")
+            or os.environ.get("JVM_PATH")
+        )
+
+        if configured:
+            path = Path(str(configured)).expanduser()
+            if path.is_dir():
+                candidate = path / "lib" / "server" / "libjvm.dylib"
+                if candidate.exists():
+                    return str(candidate)
+            if path.exists():
+                return str(path)
+            raise RuntimeError(
+                "Configured JVM path does not exist: "
+                f"{path}. Set JPYPE_JVM/JVM_PATH to the actual libjvm.dylib file, "
+                "or set JAVA_HOME to a valid JDK home."
+            )
+
+        java_home = extra_params.get("java_home") or os.environ.get("JAVA_HOME")
+        if java_home:
+            home = Path(str(java_home)).expanduser()
+            candidates = [
+                home / "lib" / "server" / "libjvm.dylib",
+                home / "jre" / "lib" / "server" / "libjvm.dylib",
+            ]
+            for candidate in candidates:
+                if candidate.exists():
+                    return str(candidate)
+
+            raise RuntimeError(
+                "JAVA_HOME is set, but the JVM library was not found. "
+                f"JAVA_HOME={home}. Expected a file like "
+                f"{home}/lib/server/libjvm.dylib."
+            )
+
+        return None
+
     def get_connection(self, m: EntityMapping) -> Any:
         if m.source_id in self._cache:
             try:
@@ -624,9 +708,142 @@ class SourceConnectionFactory:
 
         driver = importlib.import_module(m.driver_module)
         log.info("Opening %s → %s@%s:%s/%s", m.driver_module, user, host, port, db)
-        conn = driver.connect(
-            host=host, port=port, database=db, user=user, password=pw, **m.extra_params
-        )
+
+        if driver.__name__ == "jaydebeapi":
+            jdbc_driver_class = m.extra_params.get("jdbc_driver_class")
+            jdbc_url = m.extra_params.get("jdbc_url")
+            jdbc_jar_path = m.extra_params.get("jdbc_jar_path")
+
+            if not jdbc_driver_class or not jdbc_url or not jdbc_jar_path:
+                raise RuntimeError(
+                    "JayDeBeApi source requires extra_params containing "
+                    "'jdbc_driver_class', 'jdbc_url', and 'jdbc_jar_path'."
+                )
+
+            jdbc_jar = Path(str(jdbc_jar_path)).expanduser()
+            if not jdbc_jar.exists():
+                raise RuntimeError(
+                    f"JDBC driver JAR not found: {jdbc_jar}. "
+                    "Check extra_params['jdbc_jar_path'] for this data source."
+                )
+
+            jvm_path = self._resolve_jvm_path(m.extra_params)
+
+            if jvm_path:
+                conn = driver.connect(
+                    jdbc_driver_class,
+                    jdbc_url,
+                    [user, pw],
+                    str(jdbc_jar),
+                    jvm_path=jvm_path,
+                )
+            else:
+                conn = driver.connect(
+                    jdbc_driver_class,
+                    jdbc_url,
+                    [user, pw],
+                    str(jdbc_jar),
+                )
+        else:
+            conn = driver.connect(
+                host=host, port=port, database=db, user=user, password=pw, **m.extra_params
+            )
+
+        self._cache[m.source_id] = conn
+        return conn
+
+    def close_all(self) -> None:
+        for sid, conn in self._cache.items():
+            try:
+                conn.close()
+            except Exception as exc:
+                log.warning("Error closing source %s: %s", sid, exc)
+        self._cache.clear()
+
+    def build_jdbc_classpath(self, jar_folder: str) -> str:
+        """
+        Scan `jar_folder` for .jar files and return them joined into a single
+        classpath string, using the OS-appropriate path separator
+        (';' on Windows, ':' on Linux/macOS).
+
+        Parameters
+        ----------
+        jar_folder : str
+            Path to the folder containing the JDBC driver jar(s).
+
+        Returns
+        -------
+        str
+            Classpath string, e.g. "/path/jars/driver1.jar:/path/jars/driver2.jar"
+
+        Raises
+        ------
+        FileNotFoundError
+            If the folder does not exist.
+        ValueError
+            If no .jar files are found in the folder.
+        """
+        if not os.path.isdir(jar_folder):
+            raise FileNotFoundError(f"Jar folder not found: {jar_folder}")
+
+        jar_files = sorted(glob.glob(os.path.join(jar_folder, "*.jar")))
+
+        if not jar_files:
+            raise ValueError(f"No .jar files found in: {jar_folder}")
+
+        # Normalize to absolute paths for reliability regardless of CWD
+        jar_files = [os.path.abspath(jar) for jar in jar_files]
+
+        classpath = os.pathsep.join(jar_files)
+        return classpath
+
+
+    def get_connection(self, m: EntityMapping) -> Any:
+        if m.source_id in self._cache:
+            try:
+                self._cache[m.source_id].cursor().close()
+                return self._cache[m.source_id]
+            except Exception:
+                log.warning("Stale connection for source %s; reconnecting.", m.source_id)
+
+        creds = self._secrets.resolve(m.secret_ref)
+        host  = creds.get("host",   m.host)
+        port  = int(creds.get("port", m.port or 5432))
+        db    = creds.get("dbname", m.database_name)
+        user  = creds["username"]
+        pw    = creds["password"]
+
+        driver = importlib.import_module(m.driver_module)
+        log.info("Opening %s → %s@%s:%s/%s", m.driver_module, user, host, port, db)
+
+        if driver.__name__ == "jaydebeapi":
+            jdbc_driver_class = m.extra_params.get("jdbc_driver_class")
+            jdbc_url = m.extra_params.get("jdbc_url")
+            jdbc_jar_path = self.build_jdbc_classpath("jdbc")
+            #'jdbc/postgresql-42.7.13.jar;jdbc/snowflake-jdbc-4.3.1.jar' #m.extra_params.get("jdbc_jar_path")
+
+            log.info('Java Home %s', os.environ.get("JAVA_HOME", ""))
+            log.info('JDBC Driver Class %s', jdbc_driver_class)
+            log.info('JDBC URL %s', jdbc_url)
+            log.info('JDBC JAR Path %s', jdbc_jar_path)
+
+            if not jdbc_driver_class or not jdbc_url or not jdbc_jar_path:
+                raise RuntimeError(
+                    "JayDeBeApi source requires extra_params containing "
+                    "'jdbc_driver_class', 'jdbc_url', and 'jdbc_jar_path'."
+                )
+
+            conn = driver.connect(
+                jdbc_driver_class,
+                jdbc_url,
+                [user, pw],
+                jdbc_jar_path,
+            )
+        else:
+            conn = driver.connect(
+                host=host, port=port, database=db, user=user, password=pw, **m.extra_params
+            )
+
         self._cache[m.source_id] = conn
         return conn
 
@@ -654,8 +871,33 @@ def _base_query(m: EntityMapping) -> str:
     return q
 
 
+def _normalise_row(raw_cols: List[str], raw_row: tuple) -> Dict[str, Any]:
+    """
+    Build a normalised row dict from a raw DB cursor row.
+
+    Two transformations are applied:
+      1. Column names are lowercased so expressions are case-insensitive.
+         "Customer ID", "CUSTOMER_ID", and "customer_id" all become
+         "customer_id" in the row dict.
+      2. The dict is added to the eval scope under the key 'row' so that
+         columns with spaces or other characters that are invalid Python
+         identifiers can be accessed via row['column name'] in expressions.
+
+    The resulting dict therefore supports both styles:
+      id_column_expr = "'Cust_' + str(customer_id)"          # bare name
+      id_column_expr = "'Cust_' + str(row['customer id'])"   # dict access
+    """
+    normalised: Dict[str, Any] = {
+        col.lower(): val for col, val in zip(raw_cols, raw_row)
+    }
+    # Expose the dict itself under 'row' for expressions that need
+    # dict-style access (spaces, hyphens, reserved words in column names)
+    normalised["row"] = normalised.copy()
+    return normalised
+
+
 def _iter_source(
-    conn: Any, m: EntityMapping, extra_where: str = ""
+        conn: Any, m: EntityMapping, extra_where: str = ""
 ) -> Iterator[List[Dict[str, Any]]]:
     base = _base_query(m)
 
@@ -681,19 +923,19 @@ def _iter_source(
             pq = (f"SELECT * FROM ({_with_extra(base)}) AS _p "
                   f"WHERE {m.partition_column} BETWEEN {lo!r} AND {hi!r}")
             cur.execute(pq)
-            cols = [d[0] for d in cur.description]
+            raw_cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
             if rows:
-                yield [dict(zip(cols, row)) for row in rows]
+                yield [_normalise_row(raw_cols, row) for row in rows]
             lo = hi + 1
     else:
         cur.execute(_with_extra(base))
-        cols = [d[0] for d in cur.description]
+        raw_cols = [d[0] for d in cur.description]
         while True:
             rows = cur.fetchmany(m.partition_size)
             if not rows:
                 break
-            yield [dict(zip(cols, row)) for row in rows]
+            yield [_normalise_row(raw_cols, row) for row in rows]
     cur.close()
 
 
@@ -737,11 +979,78 @@ def _compute_hash(row: dict, columns: List[str]) -> str:
 
 
 def _resolve_id(m: EntityMapping, row: dict) -> Optional[str]:
-    try:
-        return str(_eval_expr(m.id_column_expr, row))
-    except Exception as exc:
-        log.warning("id_column_expr failed: %s  row=%r", exc, row)
-        return None
+    """
+    Produce a stable Neptune ~id string for a source row.
+
+    Resolution order
+    ────────────────
+    1. id_column_expr is set  →  evaluate the Python expression against the row.
+    2. id_column_expr is NULL →  composite key: concatenate entity_name with the
+       lowercased values of all attribute columns where is_id_component = TRUE,
+       joined by '_', in attr_id order.
+       Example: entity "Customer", id components [customer_id=42, region="DE"]
+                → "Customer_42_DE"
+    3. No is_id_component attrs → hash fallback: SHA-256 of entity_name + all
+       mapped column values in attr_id order, prefixed with entity_name.
+       Example: "Customer_a3f2c1d4..."
+       Deterministic for the same row content; will NOT survive column reordering
+       or value changes (row will be treated as a new node).
+    4. No attributes at all    →  log an error and return None (row is skipped).
+    """
+    # Strategy 1: explicit expression
+    if m.id_column_expr:
+        try:
+            return str(_eval_expr(m.id_column_expr, row))
+        except Exception as exc:
+            log.warning(
+                "id_column_expr eval failed for mapping %s: %s  row keys=%s",
+                m.mapping_id, exc, list(row.keys()),
+            )
+            return None
+
+    # Strategy 2: composite key from is_id_component attributes
+    id_attrs = [a for a in m.attributes if a.is_id_component]
+    if id_attrs:
+        parts = [m.entity_name]
+        for attr in id_attrs:
+            col_key = attr.source_column.lower()
+            val = row.get(col_key)
+            if val is None:
+                val = ''
+            ##    log.warning(
+            ##        "Composite id: column '%s' is NULL in mapping %s — row skipped.",
+            ##        attr.source_column, m.mapping_id,
+            ##    )
+            ##    return None
+            parts.append(str(val))
+        return "_".join(parts)
+
+    # Strategy 3: hash of all mapped column values
+    all_attrs = [a for a in m.attributes]
+    if all_attrs:
+        h = hashlib.sha256()
+        h.update(m.entity_name.encode())
+        for attr in all_attrs:
+            col_key = attr.source_column.lower()
+            val = row.get(col_key)
+            h.update(b"\x1f")  # field separator (ASCII unit separator)
+            h.update(str(val).encode() if val is not None else b"\x00")
+        node_id = f"{m.entity_name}_{h.hexdigest()}"
+        log.debug(
+            "Hash fallback id for mapping %s: %s  "
+            "(no id_column_expr and no is_id_component attributes defined)",
+            m.mapping_id, node_id,
+        )
+        return node_id
+
+    # Strategy 4: nothing available
+    log.error(
+        "Mapping %s (%s): cannot generate ~id — "
+        "id_column_expr is NULL, no is_id_component attributes, "
+        "and no mapped attributes at all.",
+        m.mapping_id, m.entity_name,
+    )
+    return None
 
 
 def _hash_columns_for(m: EntityMapping) -> List[str]:
@@ -751,7 +1060,10 @@ def _hash_columns_for(m: EntityMapping) -> List[str]:
 def _row_to_props(m: EntityMapping, row: dict) -> Dict[str, Any]:
     props: Dict[str, Any] = {}
     for attr in m.attributes:
-        val = _apply_transform(row.get(attr.source_column), attr.transform_expr)
+        # source_column may have been entered in any casing in the metadata;
+        # normalise to lowercase to match the normalised row dict keys.
+        col_key = attr.source_column.lower()
+        val = _apply_transform(row.get(col_key), attr.transform_expr)
         props[attr.target_property] = val
         if attr.privacy_class:
             props[f"{attr.target_property}__privacy_class"] = attr.privacy_class
@@ -888,6 +1200,7 @@ class EKGETLPipeline:
 
     def run_full(self, triggered_by: str = "pipeline") -> None:
         """Initial / full reload using each target's bulk-load mechanism."""
+        self._target.precheck()
         self._meta_repo.connect()
         self._run_repo.connect()
         self._current_sdts = self._meta_repo.load_current_sdts()
@@ -954,6 +1267,7 @@ class EKGETLPipeline:
 
     def run_incremental(self, triggered_by: str = "pipeline") -> None:
         """Incremental run: change detection + graph upserts / hard deletes."""
+        self._target.precheck()
         self._meta_repo.connect()
         self._run_repo.connect()
         self._current_sdts = self._meta_repo.load_current_sdts()
@@ -1257,10 +1571,10 @@ if __name__ == "__main__":
 
     target_options: Dict[str, Any] = {
         # Common — overridden by graph_creds when present
-        "endpoint":      os.environ.get("EKG_TARGET_ENDPOINT",  ""),
+        "endpoint":      graph_creds.get("endpoint", os.environ.get("EKG_TARGET_ENDPOINT",  "")),
         "username":      graph_creds.get("username", os.environ.get("EKG_TARGET_USERNAME", "")),
         "password":      graph_creds.get("password", os.environ.get("EKG_TARGET_PASSWORD", "")),
-        "database":      os.environ.get("EKG_TARGET_DATABASE",  ""),
+        "database":      graph_creds.get("database", os.environ.get("EKG_TARGET_DATABASE",  "")),
         "region":        os.environ.get("AWS_REGION",           "eu-central-1"),
         # Neptune-specific
         "s3_staging":    os.environ.get("EKG_TARGET_S3_STAGING",   ""),
@@ -1270,7 +1584,9 @@ if __name__ == "__main__":
         # Neo4j-specific
         "bulk_batch":    int(os.environ.get("EKG_TARGET_BULK_BATCH", "500")),
         # Cosmos-specific
-        "graph":         os.environ.get("EKG_TARGET_GRAPH", ""),
+        "graph":               os.environ.get("EKG_TARGET_GRAPH", ""),
+        "partition_key":       graph_creds.get("partition_key", os.environ.get("EKG_TARGET_PARTITION_KEY", "partitionKey")),
+        "partition_key_value": f"{tenant.gsr_client}:{tenant.gsr_inst}",
         # Spanner-specific
         "project":       os.environ.get("GCP_PROJECT",              ""),
         "instance":      os.environ.get("EKG_TARGET_INSTANCE",      ""),

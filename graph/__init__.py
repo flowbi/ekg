@@ -12,7 +12,7 @@ Supported targets
   spanner   Google Spanner Graph (client library + LOAD DATA mutations)
 """
 
-from graph.base import GraphTarget, BulkRecord, GraphTargetConfig
+from graph.base import GraphTarget, BulkRecord, GraphTargetConfig, PreCheckError
 from graph.neptune  import NeptuneGraphTarget
 from graph.neo4j    import Neo4jGraphTarget
 from graph.cosmos   import CosmosGraphTarget
@@ -55,5 +55,6 @@ __all__ = [
     "GraphTarget",
     "BulkRecord",
     "GraphTargetConfig",
+    "PreCheckError",
     "create_graph_target",
 ]

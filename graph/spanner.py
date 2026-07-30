@@ -90,6 +90,56 @@ class SpannerGraphTarget(GraphTarget):
         )
 
     # ------------------------------------------------------------------
+    # Precheck
+    # ------------------------------------------------------------------
+
+    def _do_precheck(self) -> None:
+        """
+        Execute SELECT 1 via a read-only Spanner transaction.
+        Confirms Application Default Credentials and instance/database access.
+        Also verifies that the required node and edge tables exist.
+        """
+        log.debug("Spanner precheck: SELECT 1")
+        with self._db.snapshot() as snapshot:
+            results = list(snapshot.execute_sql("SELECT 1"))
+            if not results or results[0][0] != 1:
+                from graph.base import PreCheckError
+                raise PreCheckError("Spanner precheck SELECT 1 returned unexpected result.")
+
+        # Verify node and edge tables exist
+        table_check_sql = """
+            SELECT t.TABLE_NAME
+            FROM INFORMATION_SCHEMA.TABLES t
+            WHERE t.TABLE_NAME IN UNNEST(@tables)
+        """
+        required = [self._node_table, self._edge_table]
+        with self._db.snapshot() as snapshot:
+            found = {
+                row[0]
+                for row in snapshot.execute_sql(
+                    table_check_sql,
+                    params={"tables": required},
+                    param_types={
+                        "tables": self._spanner.param_types.Array(
+                            self._spanner.param_types.STRING
+                        )
+                    },
+                )
+            }
+        missing = set(required) - found
+        if missing:
+            from graph.base import PreCheckError
+            raise PreCheckError(
+                f"Spanner precheck: required table(s) not found: {sorted(missing)}. "
+                f"Apply the node/edge table DDL before running the pipeline."
+            )
+
+        log.info(
+            "Spanner precheck succeeded. Tables confirmed: %s, %s.",
+            self._node_table, self._edge_table,
+        )
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 

@@ -63,6 +63,27 @@ class Neo4jGraphTarget(GraphTarget):
         log.info("Neo4j target connected to %s (db=%s)", endpoint, self._database)
 
     # ------------------------------------------------------------------
+    # Precheck
+    # ------------------------------------------------------------------
+
+    def _do_precheck(self) -> None:
+        """
+        Run RETURN 1 AS ok — lightest Bolt query that confirms both
+        network connectivity and that credentials are accepted.
+        """
+        log.debug("Neo4j precheck: RETURN 1")
+        with self._driver.session(database=self._database) as session:
+            result = session.run("RETURN 1 AS ok")
+            record = result.single()
+            if record is None or record["ok"] != 1:
+                from graph.base import PreCheckError
+                raise PreCheckError(
+                    "Neo4j precheck query returned unexpected result. "
+                    f"Expected ok=1, got: {record}"
+                )
+        log.info("Neo4j precheck succeeded (db=%s).", self._database)
+
+    # ------------------------------------------------------------------
     # Incremental operations
     # ------------------------------------------------------------------
 
