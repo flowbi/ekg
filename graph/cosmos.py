@@ -78,6 +78,14 @@ def _build_cosmos_client(endpoint: str, username: str, password: str, timeout: i
     factory.  The standard Client(url, traversal_source, username=, password=)
     signature works when combined with the correct serializer; no
     DriverRemoteConnection is used.
+
+    pool_size=1 pins every request to a single WebSocket connection. Every
+    upsert here is a read-then-write (coalesce(unfold(), addV/addE(...))) run
+    strictly sequentially — submitAsync() is always followed immediately by
+    .result() — so the default pool_size=8 buys no throughput but risks a
+    later request landing on a different pooled connection than the one that
+    made the prior write, which can surface as sustained 409/412 conflicts if
+    session-consistency state isn't shared across connections.
     """
     from gremlin_python.driver import client as gremlin_client   # type: ignore
     from gremlin_python.driver import serializer                  # type: ignore
@@ -89,6 +97,7 @@ def _build_cosmos_client(endpoint: str, username: str, password: str, timeout: i
         username=username,
         password=password,
         message_serializer=serializer.GraphSONSerializersV2d0(),
+        pool_size=1,
     ), GremlinServerError
 
 

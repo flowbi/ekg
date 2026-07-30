@@ -274,8 +274,11 @@ class EntityMapping:
     entity_name:          str
     entity_type:          str
     id_column_expr:       Optional[str]
-    from_id_column_expr:  Optional[str]
-    to_id_column_expr:    Optional[str]
+    # Edge-only: mapping_id of the from/to node's own EntityMapping. The
+    # referenced mapping is looked up by this id and its own _resolve_id()
+    # is reused against this edge's row.
+    from_mapping_id:      Optional[str]
+    to_mapping_id:        Optional[str]
     row_filter:           Optional[str]
     change_mode:          str
     watermark_column:     Optional[str]
@@ -396,8 +399,8 @@ class MetaRepository:
                 entity_name          = r["entity_name"],
                 entity_type          = r["entity_type"],
                 id_column_expr       = r["id_column_expr"],
-                from_id_column_expr  = r["from_id_column_expr"],
-                to_id_column_expr    = r["to_id_column_expr"],
+                from_mapping_id      = r["from_mapping_id"],
+                to_mapping_id        = r["to_mapping_id"],
                 row_filter           = r["row_filter"],
                 change_mode          = r["change_mode"],
                 watermark_column     = r["watermark_column"],
@@ -1053,6 +1056,41 @@ def _resolve_id(m: EntityMapping, row: dict) -> Optional[str]:
     return None
 
 
+def _resolve_ref_id(
+    mapping_by_id: Dict[str, EntityMapping],
+    ref_mapping_id: Optional[str],
+    row: dict,
+    mapping_id: str,
+    side: str,
+) -> Optional[str]:
+    """
+    Resolve an edge's 'from' or 'to' endpoint ~id from the edge's own row.
+
+    from_mapping_id / to_mapping_id holds the mapping_id of the referenced
+    node's own EntityMapping (see meta.cte.entity_mapping's edge branch,
+    which joins to the referenced hub/link and selects its mapping_id). Look
+    that mapping up and reuse its own _resolve_id() against this edge's row
+    — the row must expose the same column names the referenced node's own
+    id resolution reads.
+    """
+    if not ref_mapping_id:
+        log.error(
+            "Mapping %s: %s_mapping_id is not set — cannot resolve %s-side id.",
+            mapping_id, side, side,
+        )
+        return None
+
+    target = mapping_by_id.get(ref_mapping_id)
+    if target is None:
+        log.error(
+            "Mapping %s: %s_mapping_id '%s' does not match any loaded mapping_id.",
+            mapping_id, side, ref_mapping_id,
+        )
+        return None
+
+    return _resolve_id(target, row)
+
+
 def _hash_columns_for(m: EntityMapping) -> List[str]:
     return m.hash_columns or [a.source_column for a in m.attributes]
 
@@ -1088,7 +1126,11 @@ class _ChangeResult:
         self.seen_ids:     Set[str]                                         = set()
 
 
-def _detect_timestamp(m: EntityMapping, batches: Iterator[List[dict]]) -> _ChangeResult:
+def _detect_timestamp(
+    m: EntityMapping,
+    batches: Iterator[List[dict]],
+    mapping_by_id: Dict[str, EntityMapping],
+) -> _ChangeResult:
     result = _ChangeResult()
     for batch in batches:
         for row in batch:
@@ -1108,11 +1150,15 @@ def _detect_timestamp(m: EntityMapping, batches: Iterator[List[dict]]) -> _Chang
             if m.entity_type == "node":
                 result.upsert_nodes.append((node_id, m.entity_name, props))
             else:
-                try:
-                    from_id = str(_eval_expr(m.from_id_column_expr, row))
-                    to_id   = str(_eval_expr(m.to_id_column_expr,   row))
-                except Exception as exc:
-                    log.warning("Edge id eval failed: %s", exc)
+                from_id = _resolve_ref_id(
+                    mapping_by_id, m.from_mapping_id,
+                    row, m.mapping_id, "from",
+                )
+                to_id = _resolve_ref_id(
+                    mapping_by_id, m.to_mapping_id,
+                    row, m.mapping_id, "to",
+                )
+                if from_id is None or to_id is None:
                     result.skipped += 1
                     continue
                 result.upsert_edges.append((node_id, m.entity_name, from_id, to_id, props))
@@ -1120,7 +1166,10 @@ def _detect_timestamp(m: EntityMapping, batches: Iterator[List[dict]]) -> _Chang
 
 
 def _detect_hash(
-    m: EntityMapping, batches: Iterator[List[dict]], stored: Dict[str, str]
+    m: EntityMapping,
+    batches: Iterator[List[dict]],
+    stored: Dict[str, str],
+    mapping_by_id: Dict[str, EntityMapping],
 ) -> _ChangeResult:
     result        = _ChangeResult()
     hash_cols     = _hash_columns_for(m)
@@ -1141,11 +1190,15 @@ def _detect_hash(
             if m.entity_type == "node":
                 result.upsert_nodes.append((node_id, m.entity_name, props))
             else:
-                try:
-                    from_id = str(_eval_expr(m.from_id_column_expr, row))
-                    to_id   = str(_eval_expr(m.to_id_column_expr,   row))
-                except Exception as exc:
-                    log.warning("Edge id eval failed: %s", exc)
+                from_id = _resolve_ref_id(
+                    mapping_by_id, m.from_mapping_id,
+                    row, m.mapping_id, "from",
+                )
+                to_id = _resolve_ref_id(
+                    mapping_by_id, m.to_mapping_id,
+                    row, m.mapping_id, "to",
+                )
+                if from_id is None or to_id is None:
                     result.skipped += 1
                     continue
                 result.upsert_edges.append((node_id, m.entity_name, from_id, to_id, props))
@@ -1193,6 +1246,7 @@ class EKGETLPipeline:
         self._run_repo    = RunRepository(run_cfg, secrets)
         self._src_factory = SourceConnectionFactory(secrets)
         self._current_sdts: Optional[datetime] = None   # set at connect time
+        self._mapping_by_id: Dict[str, EntityMapping] = {}
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -1211,6 +1265,7 @@ class EKGETLPipeline:
 
         try:
             mappings = self._meta_repo.load_mappings()
+            self._mapping_by_id = {mm.mapping_id: mm for mm in mappings}
             self._target.begin_bulk()
 
             # Write ConceptTag nodes first (before data nodes)
@@ -1231,6 +1286,8 @@ class EKGETLPipeline:
                                 self._target.write_bulk_node(rec)
                             else:
                                 self._target.write_bulk_edge(rec)
+                                log.info("Edge %s (%s): %s -> %s",
+                                          rec.entity_id, rec.label, rec.from_id, rec.to_id)
                             written += 1
                     total_up += written
                     total_sk += skipped
@@ -1278,6 +1335,7 @@ class EKGETLPipeline:
 
         try:
             mappings = self._meta_repo.load_mappings()
+            self._mapping_by_id = {mm.mapping_id: mm for mm in mappings}
             self._ensure_concept_tag_nodes(mappings)
 
             for m in mappings:
@@ -1375,11 +1433,15 @@ class EKGETLPipeline:
                 label       = m.entity_name,
                 props       = props,
             )
-        try:
-            from_id = str(_eval_expr(m.from_id_column_expr, row))
-            to_id   = str(_eval_expr(m.to_id_column_expr,   row))
-        except Exception as exc:
-            log.warning("Edge from/to eval failed: %s", exc)
+        from_id = _resolve_ref_id(
+            self._mapping_by_id, m.from_mapping_id,
+            row, m.mapping_id, "from",
+        )
+        to_id = _resolve_ref_id(
+            self._mapping_by_id, m.to_mapping_id,
+            row, m.mapping_id, "to",
+        )
+        if from_id is None or to_id is None:
             return None
         return BulkRecord(
             entity_type = "edge",
@@ -1413,7 +1475,9 @@ class EKGETLPipeline:
             if last_wm is not None else ""
         )
         log.info("Timestamp mode mapping %s: last_watermark=%s", m.mapping_id, last_wm)
-        result  = _detect_timestamp(m, _iter_source(conn, m, extra_where=extra_where))
+        result  = _detect_timestamp(
+            m, _iter_source(conn, m, extra_where=extra_where), self._mapping_by_id,
+        )
         up      = self._apply_upserts(m, result)
         deleted = self._apply_deletes(m, result.delete_ids)
         self._run_repo.commit_watermark(m.mapping_id)
@@ -1428,7 +1492,7 @@ class EKGETLPipeline:
     ) -> Tuple[int, int, int]:
         stored  = self._run_repo.load_hashes(m.mapping_id)
         log.info("Hash mode mapping %s: %d stored hashes.", m.mapping_id, len(stored))
-        result  = _detect_hash(m, _iter_source(conn, m), stored)
+        result  = _detect_hash(m, _iter_source(conn, m), stored, self._mapping_by_id)
         up      = self._apply_upserts(m, result)
         deleted = self._apply_deletes(m, result.delete_ids)
         self._run_repo.upsert_hashes(m.mapping_id, run_id, result.new_hashes)
@@ -1455,6 +1519,7 @@ class EKGETLPipeline:
             for i in range(0, len(result.upsert_edges), EKG_BATCH_SIZE):
                 for edge_id, label, from_id, to_id, props in result.upsert_edges[i : i + EKG_BATCH_SIZE]:
                     self._target.upsert_edge(edge_id, label, from_id, to_id, props)
+                    log.info("Edge %s (%s): %s -> %s", edge_id, label, from_id, to_id)
                     total += 1
                 log.debug("Upserted %d/%d edges (mapping %s).",
                            total, len(result.upsert_edges), m.mapping_id)
