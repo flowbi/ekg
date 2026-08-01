@@ -11,6 +11,8 @@ Supported targets
   cosmos    Azure Cosmos DB for Apache Gremlin (Gremlin WebSocket + batched upserts)
   spanner   Google Spanner Graph (client library + LOAD DATA mutations)
   gml       GML file     (networkx; no live database — the file is the target)
+  graphml   GraphML file (networkx; no live database — more consistently
+                          supported across third-party viewers than gml)
 """
 
 from graph.base import GraphTarget, BulkRecord, GraphTargetConfig, PreCheckError
@@ -19,6 +21,7 @@ from graph.neo4j    import Neo4jGraphTarget
 from graph.cosmos   import CosmosGraphTarget
 from graph.spanner  import SpannerGraphTarget
 from graph.gml      import GmlGraphTarget
+from graph.graphml  import GraphMlGraphTarget
 
 _REGISTRY: dict = {
     "neptune": NeptuneGraphTarget,
@@ -26,6 +29,7 @@ _REGISTRY: dict = {
     "cosmos":  CosmosGraphTarget,
     "spanner": SpannerGraphTarget,
     "gml":     GmlGraphTarget,
+    "graphml": GraphMlGraphTarget,
 }
 
 
@@ -36,7 +40,7 @@ def create_graph_target(target_name: str, config: GraphTargetConfig) -> GraphTar
     Parameters
     ----------
     target_name : str
-        One of 'neptune', 'neo4j', 'cosmos', 'spanner', 'gml'.
+        One of 'neptune', 'neo4j', 'cosmos', 'spanner', 'gml', 'graphml'.
     config : GraphTargetConfig
         Target-specific configuration dataclass.
 

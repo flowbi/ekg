@@ -1,9 +1,13 @@
 """
-graph/gml.py  –  GML (Graph Modelling Language) file graph target.
+graph/graphml.py  –  GraphML file graph target.
 
-There is no live database here — the output file *is* the target. The full
-graph is held in memory (as a networkx MultiDiGraph) for the duration of a
-run and materialised to disk on close()/commit_bulk().
+There is no live database here — the output file *is* the target, same
+model as graph/gml.py. This target exists because GML compatibility across
+third-party viewers is inconsistent (networkx's GML writer's own extensions
+for parallel edges aren't universally supported, and some importers are
+stricter than others about property typing) — GraphML is an XML format with
+a formal XSD schema and is more consistently supported. Prefer this target
+over gml.py unless you specifically need GML.
 
 Incremental writes  →  In-memory graph, mutated per upsert/delete. The
                         existing file (if present) is loaded at startup so
@@ -21,22 +25,23 @@ Bulk load           →  Buffered like the other targets (begin_bulk /
 
 Required options (GraphTargetConfig.options)
 ────────────────────────────────────────────
-  endpoint   str   Path to the .gml output file, e.g. "./output/ekg.gml"
+  endpoint   str   Path to the .graphml output file, e.g. "./output/ekg.graphml"
                     (EKG_TARGET_ENDPOINT). The parent directory is created
                     if it doesn't exist.
 
-GML node/edge identity
-───────────────────────
-GML requires integer node ids at the file level; networkx assigns those
-transparently on write and uses each node's GML `label` field to store
-`str(node_key)` for round-tripping. We use our own string ~id (node_id /
-edge_id) directly as the networkx node/edge key, so a node's GML `label`
-field ends up holding exactly that id string — which is how the existing
-file is re-keyed correctly on load (read_gml(..., label='label')).
+GraphML node/edge identity
+────────────────────────────
+Unlike GML, GraphML node/edge ids are arbitrary strings, so our own string
+~id (node_id / edge_id) is used directly — no synthetic-integer-id
+workaround needed. Parallel edges are handled natively by networkx's
+GraphML reader/writer (each <edge> carries its own `id` attribute), so
+unlike gml.py there's no dual write-path for the multigraph case.
 
-Because GML's own `label` keyword is used this way, our *semantic* node/edge
-label (e.g. "Customer", "REFERENCES") is stored under a separate attribute,
-`entity_label`, to avoid colliding with it.
+Because GraphML doesn't reserve any property name the way GML reserves
+`label`, our semantic node/edge label (e.g. "Customer", "REFERENCES") is
+still stored under `entity_label` rather than `label`, purely to keep
+property names consistent with the GML target for anyone switching between
+the two.
 
 Dependencies
 ────────────
@@ -47,38 +52,17 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from graph.base import BulkRecord, GraphTarget, GraphTargetConfig, PreCheckError
 from graph._props import sanitize_props
 
-log = logging.getLogger("ekg_etl.graph.gml")
-
-_KEY_RE = re.compile(r"[^A-Za-z0-9_]")
+log = logging.getLogger("ekg_etl.graph.graphml")
 
 
-def _sanitize_key(key: str) -> str:
+class GraphMlGraphTarget(GraphTarget):
     """
-    GML keys must match networkx's `^[A-Za-z][0-9A-Za-z_]*$` — alphanumeric
-    or underscore, but the *first* character must be a letter (a leading
-    digit or underscore, e.g. "_DeletedDateTS_", is rejected). Property
-    names coming from attribute_mapping are user-authored and not
-    guaranteed to satisfy this, so sanitize defensively.
-    """
-    sanitized = _KEY_RE.sub("_", key)
-    if not sanitized or not sanitized[0].isalpha():
-        sanitized = f"k_{sanitized}"
-    return sanitized
-
-
-def _sanitize_props(props: Dict[str, Any]) -> Dict[str, Any]:
-    return {_sanitize_key(k): v for k, v in sanitize_props(props).items()}
-
-
-class GmlGraphTarget(GraphTarget):
-    """
-    File-based GraphTarget that materializes the graph as GML.
+    File-based GraphTarget that materializes the graph as GraphML.
 
     All upserts merge new properties onto existing ones (matching the
     "SET n += props" semantics of the Neo4j/Cosmos targets), rather than
@@ -96,8 +80,8 @@ class GmlGraphTarget(GraphTarget):
         path = config.get("endpoint", "").strip()
         if not path:
             raise ValueError(
-                "GML output path is not configured. "
-                "Set EKG_TARGET_ENDPOINT to a file path, e.g. ./output/ekg.gml"
+                "GraphML output path is not configured. "
+                "Set EKG_TARGET_ENDPOINT to a file path, e.g. ./output/ekg.graphml"
             )
         self._path = path
 
@@ -117,7 +101,7 @@ class GmlGraphTarget(GraphTarget):
         self._bulk_edges: List[BulkRecord] = []
 
         log.info(
-            "GML target ready: %s (%d existing node(s), %d existing edge(s))",
+            "GraphML target ready: %s (%d existing node(s), %d existing edge(s))",
             self._path, self._graph.number_of_nodes(), self._graph.number_of_edges(),
         )
 
@@ -128,16 +112,16 @@ class GmlGraphTarget(GraphTarget):
     def _do_precheck(self) -> None:
         """Confirm the output directory is writable by touching a temp file."""
         out_dir = os.path.dirname(os.path.abspath(self._path)) or "."
-        probe = os.path.join(out_dir, ".ekg_gml_write_test")
+        probe = os.path.join(out_dir, ".ekg_graphml_write_test")
         try:
             with open(probe, "w") as f:
                 f.write("")
             os.remove(probe)
         except OSError as exc:
             raise PreCheckError(
-                f"GML output directory is not writable: {out_dir}: {exc}"
+                f"GraphML output directory is not writable: {out_dir}: {exc}"
             ) from exc
-        log.info("GML precheck OK: %s is writable.", out_dir)
+        log.info("GraphML precheck OK: %s is writable.", out_dir)
 
     # ------------------------------------------------------------------
     # Existing-file loading / flushing
@@ -147,19 +131,19 @@ class GmlGraphTarget(GraphTarget):
         if not os.path.exists(self._path):
             return self._nx.MultiDiGraph()
         try:
-            loaded = self._nx.read_gml(self._path, label="label")
+            loaded = self._nx.read_graphml(self._path)
         except Exception as exc:
             log.warning(
-                "Could not read existing GML file %s (%s); starting from an empty graph.",
+                "Could not read existing GraphML file %s (%s); starting from an empty graph.",
                 self._path, exc,
             )
             return self._nx.MultiDiGraph()
 
-        # The file may have been written as a plain DiGraph (see _flush()) or,
-        # if it had parallel edges, as a MultiDiGraph. Normalise back to a
-        # MultiDiGraph either way, using each edge's 'ekg_id' property (not
-        # networkx's own multigraph 'key', which a plain DiGraph doesn't have)
-        # as the canonical edge identity.
+        # read_graphml returns a plain DiGraph when the file has no parallel
+        # edges, or a MultiDiGraph (with our own edge ids as keys, since
+        # GraphML's <edge id="..."> is preserved as the multigraph key) when
+        # it does. Normalise to MultiDiGraph either way; when non-multi, the
+        # edge id still survives as a plain 'id' data field.
         graph = self._nx.MultiDiGraph()
         graph.add_nodes_from(loaded.nodes(data=True))
         if loaded.is_multigraph():
@@ -167,35 +151,14 @@ class GmlGraphTarget(GraphTarget):
         else:
             edges = ((u, v, None, data) for u, v, data in loaded.edges(data=True))
         for u, v, key, data in edges:
-            edge_id = data.get("ekg_id") or key or f"{u}->{v}"
+            edge_id = data.pop("id", None) or key or f"{u}->{v}"
             graph.add_edge(u, v, key=edge_id, **data)
         return graph
 
     def _flush(self) -> None:
-        # networkx unconditionally emits a graph-level 'multigraph 1' flag and
-        # a per-edge 'key' field for any MultiDiGraph, regardless of whether
-        # parallel edges actually exist. That's a networkx-specific GML
-        # extension, not part of the original spec, and plenty of third-party
-        # readers (e.g. Graphia) fail to open a file that uses it. Only pay
-        # that compatibility cost when the graph genuinely needs it.
-        pairs = [(u, v) for u, v in self._graph.edges()]
-        has_parallel_edges = len(pairs) != len(set(pairs))
-        if has_parallel_edges:
-            log.warning(
-                "GML: this graph has parallel edges (multiple edges between "
-                "the same node pair), so the file is written with networkx's "
-                "multigraph GML extension ('multigraph 1' + per-edge 'key'). "
-                "Some GML viewers don't support that extension and may fail "
-                "to open the file."
-            )
-            self._nx.write_gml(self._graph, self._path)
-        else:
-            plain = self._nx.DiGraph()
-            plain.add_nodes_from(self._graph.nodes(data=True))
-            plain.add_edges_from(self._graph.edges(data=True))
-            self._nx.write_gml(plain, self._path)
+        self._nx.write_graphml(self._graph, self._path)
         log.info(
-            "GML: wrote %s (%d node(s), %d edge(s)).",
+            "GraphML: wrote %s (%d node(s), %d edge(s)).",
             self._path, self._graph.number_of_nodes(), self._graph.number_of_edges(),
         )
 
@@ -204,7 +167,7 @@ class GmlGraphTarget(GraphTarget):
     # ------------------------------------------------------------------
 
     def upsert_node(self, node_id: str, label: str, props: Dict[str, Any]) -> None:
-        self._graph.add_node(node_id, entity_label=label, **_sanitize_props(props))
+        self._graph.add_node(node_id, entity_label=label, **sanitize_props(props))
 
     def upsert_edge(
         self, edge_id: str, label: str, from_id: str, to_id: str, props: Dict[str, Any]
@@ -217,8 +180,7 @@ class GmlGraphTarget(GraphTarget):
             )
             return
         self._graph.add_edge(
-            from_id, to_id, key=edge_id, entity_label=label, ekg_id=edge_id,
-            **_sanitize_props(props),
+            from_id, to_id, key=edge_id, entity_label=label, **sanitize_props(props),
         )
         self._edge_endpoints[edge_id] = (from_id, to_id)
 
@@ -262,7 +224,7 @@ class GmlGraphTarget(GraphTarget):
         self._edge_endpoints = {}
         self._bulk_nodes = []
         self._bulk_edges = []
-        log.debug("GML bulk: starting from an empty graph")
+        log.debug("GraphML bulk: starting from an empty graph")
 
     def write_bulk_node(self, record: BulkRecord) -> None:
         self._bulk_nodes.append(record)
@@ -277,7 +239,7 @@ class GmlGraphTarget(GraphTarget):
             self.upsert_edge(rec.entity_id, rec.label, rec.from_id, rec.to_id, rec.props)
         self._flush()
         log.info(
-            "GML bulk: committed %d node(s), %d edge(s).",
+            "GraphML bulk: committed %d node(s), %d edge(s).",
             len(self._bulk_nodes), len(self._bulk_edges),
         )
         return ""
