@@ -42,7 +42,7 @@ Logging targets
 
 Graph target
 ────────────
-  Set EKG_GRAPH_TARGET to one of: neptune, neo4j, cosmos, spanner.
+  Set EKG_GRAPH_TARGET to one of: neptune, neo4j, cosmos, spanner, gml.
   Target-specific options are read from env vars prefixed EKG_TARGET_*.
 
 Run modes

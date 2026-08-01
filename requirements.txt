@@ -47,6 +47,9 @@ gremlinpython>=3.7
 # Google Spanner Graph
 google-cloud-spanner>=3.43
 
+# GML file target  (no live database — file I/O only)
+networkx>=3.0
+
 
 # ---------------------------------------------------------------------------
 # Secret providers  –  install the one(s) you need
