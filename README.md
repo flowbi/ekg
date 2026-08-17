@@ -4,7 +4,7 @@ Enterprise Knowledge Graph ETL pipeline — incremental, multi-target, multi-clo
 
 Extracts business data from relational source databases, transforms it into a
 graph model driven entirely by metadata, and loads it into a supported graph
-database. Designed for Scalefree's Data Vault-based EKG architecture.
+database. 
 
 ---
 
